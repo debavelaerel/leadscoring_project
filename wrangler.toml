@@ -1,0 +1,36 @@
+# =============================================================================
+# Lead Score Vício — Cloudflare Worker
+#
+# O mesmo Worker serve a API (/api/*) e o front buildado (dist/).
+# Secrets (não ficam aqui):
+#   wrangler secret put DATABASE_URL     # postgres://user:senha@host:5432/postgres
+#   wrangler secret put PAINEL_TOKEN     # opcional, protege o painel
+# Em dev (`wrangler dev`) esses valores vêm do arquivo .dev.vars.
+# =============================================================================
+
+name = "leadscore-vicio"
+main = "worker/src/index.ts"
+compatibility_date = "2026-08-01"
+# necessário pro driver do Postgres (node-postgres) rodar no Worker
+compatibility_flags = ["nodejs_compat"]
+
+[assets]
+directory = "./dist"
+binding = "ASSETS"
+# rotas de API entram no Worker; o resto é arquivo estático servido direto
+run_worker_first = ["/api/*"]
+# front é SPA: qualquer caminho desconhecido devolve o index.html
+not_found_handling = "single-page-application"
+
+[observability]
+enabled = true
+
+# ---------------------------------------------------------------------------
+# Opcional: Hyperdrive (pooling + cache na borda). Depois de criar com
+#   wrangler hyperdrive create leadscore --connection-string "postgres://..."
+# descomente abaixo com o id devolvido. O código usa automaticamente e o
+# DATABASE_URL vira só o caminho de fallback.
+# ---------------------------------------------------------------------------
+# [[hyperdrive]]
+# binding = "HYPERDRIVE"
+# id = "COLE_O_ID_AQUI"

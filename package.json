@@ -1,0 +1,39 @@
+{
+  "name": "leadscore-vicio",
+  "private": true,
+  "version": "0.3.0",
+  "type": "module",
+  "description": "Lead Score Vício & VDE — cruzamento pesquisa de leads × compradores (RDS + Cloudflare Worker)",
+  "scripts": {
+    "dev": "vite",
+    "dev:api": "wrangler dev --port 8787",
+    "build": "vite build",
+    "preview": "vite preview --host",
+    "deploy": "npm run build && wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "db:check": "node scripts/checar-rds.mjs",
+    "db:url": "node scripts/url-banco.mjs",
+    "db:dev-vars": "node scripts/url-banco.mjs --dev-vars",
+    "db:migrate": "node db/aplicar.mjs",
+    "db:migrate:dry": "node db/aplicar.mjs --dry-run"
+  },
+  "dependencies": {
+    "lucide-react": "^0.462.0",
+    "papaparse": "^5.4.1",
+    "pg": "^8.13.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260811.1",
+    "@types/node": "^22.10.0",
+    "@types/pg": "^8.11.10",
+    "@vitejs/plugin-react": "^4.3.3",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.7.2",
+    "vite": "^5.4.11",
+    "wrangler": "^4.0.0"
+  }
+}

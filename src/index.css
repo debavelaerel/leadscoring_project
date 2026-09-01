@@ -1,0 +1,82 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html {
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+
+  body {
+    @apply bg-ink-50 text-ink-800 transition-colors duration-200;
+    background-image:
+      radial-gradient(1200px 520px at 10% -10%, rgba(124, 70, 179, 0.12), transparent 60%),
+      radial-gradient(900px 420px at 100% 0%, rgba(180, 148, 222, 0.18), transparent 60%);
+    background-attachment: fixed;
+  }
+
+  html.dark body {
+    @apply bg-ink-900 text-ink-100;
+    background-image:
+      radial-gradient(1200px 520px at 10% -10%, rgba(124, 70, 179, 0.18), transparent 60%),
+      radial-gradient(900px 420px at 100% 0%, rgba(82, 38, 122, 0.28), transparent 60%);
+  }
+
+  ::selection {
+    background: rgba(124, 70, 179, 0.25);
+  }
+  html.dark ::selection {
+    background: rgba(180, 148, 222, 0.35);
+  }
+}
+
+@layer components {
+  .card {
+    @apply rounded-2xl border border-ink-100/70 bg-white/70 backdrop-blur-sm shadow-card
+           dark:border-ink-700/60 dark:bg-ink-800/70 dark:shadow-none;
+  }
+
+  .card-dark {
+    @apply rounded-2xl border border-white/10 bg-gradient-vicio-dark text-white shadow-glow-vicio;
+  }
+
+  .chip {
+    @apply inline-flex items-center gap-1.5 rounded-full px-2.5 py-1 text-xs font-medium;
+  }
+
+  .btn-ghost {
+    @apply inline-flex items-center gap-2 rounded-lg px-3 py-2 text-sm font-medium text-ink-600 hover:bg-ink-100/70 transition
+           dark:text-ink-200 dark:hover:bg-ink-700/50;
+  }
+
+  .btn-primary {
+    @apply inline-flex items-center gap-2 rounded-lg bg-vicio-600 px-3.5 py-2 text-sm font-semibold text-white shadow-sm hover:bg-vicio-700 transition disabled:opacity-50 disabled:pointer-events-none;
+  }
+
+  .section-title {
+    @apply text-sm font-semibold uppercase tracking-wider text-vicio-700 dark:text-vicio-300;
+  }
+
+  .input {
+    @apply w-full rounded-lg border border-ink-200 bg-white px-3 py-2 text-sm text-ink-800 outline-none
+           focus:border-vicio-400 focus:ring-2 focus:ring-vicio-200
+           dark:border-ink-700 dark:bg-ink-800 dark:text-ink-100 dark:focus:ring-vicio-700/40;
+  }
+}
+
+/* Selects nativos legíveis no modo noturno */
+html.dark select {
+  color-scheme: dark;
+}
+html.dark select option,
+html.dark select optgroup {
+  background-color: #1d1b2a;
+  color: #edecf5;
+}
+html.dark select option:checked,
+html.dark select option:hover {
+  background-color: #52267a;
+  color: #ffffff;
+}

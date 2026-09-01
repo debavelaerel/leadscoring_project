@@ -1,0 +1,21 @@
+# Configuração do Supabase CLI.
+# O que importa aqui é o project_id; o resto vale só para `supabase start`
+# (stack local em Docker), que este projeto não usa.
+
+project_id = "projeto-leadscore"
+
+[api]
+enabled = true
+port = 54321
+schemas = ["public", "storage", "graphql_public"]
+extra_search_path = ["public", "extensions"]
+max_rows = 1000
+
+[db]
+port = 54322
+shadow_port = 54320
+major_version = 15
+
+[storage]
+enabled = true
+file_size_limit = "50MiB"
