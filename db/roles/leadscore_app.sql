@@ -68,6 +68,14 @@ begin
       join pg_namespace n on n.oid = c.relnamespace
      where n.nspname = 'leadscore'
        and c.relkind in ('r', 'S', 'v', 'm')
+       -- sequence de coluna serial/identity não troca de dono sozinha: ela
+       -- segue a tabela. Tentar trocar dá "cannot change owner of sequence".
+       and not (c.relkind = 'S' and exists (
+             select 1
+               from pg_depend d
+              where d.classid = 'pg_class'::regclass
+                and d.objid = c.oid
+                and d.deptype = 'a'))
   loop
     execute format(
       'alter %s leadscore.%I owner to leadscore_app',
