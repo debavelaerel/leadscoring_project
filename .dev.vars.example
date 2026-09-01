@@ -3,9 +3,9 @@
 
 # O mesmo banco do painel de aprovados. O projeto escreve só no schema
 # `leadscore` e lê o `plataforma1_espelho`.
-# Se o banco aceitar TLS, troque para ?sslmode=require — aí a senha para de
+# RDS suporta TLS de fábrica: mantenha ?sslmode=require para a senha não
 # trafegar em texto puro pela internet.
-DATABASE_URL=postgres://USUARIO:SENHA@adf6bf1a3e13547689c2f8c223647464-984e0b66db785574.elb.sa-east-1.amazonaws.com:5432/postgres?sslmode=disable
+DATABASE_URL=postgres://USUARIO:SENHA@SEU-RDS.xxxxxxxxxxxx.sa-east-1.rds.amazonaws.com:5432/postgres?sslmode=require
 
 # Opcional: se preencher, o painel passa a exigir este token.
 # Deixe vazio em dev para não precisar digitar nada.

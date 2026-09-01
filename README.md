@@ -70,6 +70,10 @@ npm run dev        # painel  → http://localhost:5175
 
 ### 1. Conferir o banco
 
+> Banco ainda não provisionado? `docs/INFRA-RDS.md` tem o pedido pronto para a
+> infra: engine, permissões, rede e por que o `plataforma1_espelho` precisa
+> estar no mesmo banco.
+
 A credencial fica num lugar só. Os scripts leem, nesta ordem, `.env` → `.dev.vars`
 → `api/.env` (o antigo, com `DB_HOST`/`DB_USER`/`DB_PASSWORD`), e aceitam tanto
 `DATABASE_URL` quanto as variáveis separadas. Se o `api/.env` já está preenchido,
