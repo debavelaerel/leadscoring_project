@@ -794,7 +794,10 @@ async function rotaLeads(c: Client, id: string, url: URL) {
 }
 
 const campoCsv = (v: unknown): string => {
-  const s = v === null || v === undefined ? '' : String(v)
+  let s = v === null || v === undefined ? '' : String(v)
+  // texto vindo do lead (nome, e-mail, respostas) não pode virar fórmula no Excel/Sheets;
+  // números ficam como estão (um score negativo não é fórmula)
+  if (typeof v === 'string' && /^[=+\-@\t\r]/.test(s)) s = `'${s}`
   return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s
 }
 
