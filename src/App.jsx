@@ -5,6 +5,7 @@ import Logo from './components/Logo.jsx'
 import UploadPage from './pages/UploadPage.jsx'
 import DatasetsPage from './pages/DatasetsPage.jsx'
 import ModeloPage from './pages/ModeloPage.jsx'
+import CaptacaoPage from './pages/CaptacaoPage.jsx'
 import AnalysisPage from './pages/AnalysisPage.jsx'
 import LeadsPage from './pages/LeadsPage.jsx'
 import { useTheme } from './lib/theme.jsx'
@@ -13,6 +14,7 @@ const NAV_MOBILE = [
   { id: 'upload', label: 'Nova análise' },
   { id: 'bases', label: 'Bases' },
   { id: 'modelo', label: 'Modelo' },
+  { id: 'captacao', label: 'Captação' },
   { id: 'analise', label: 'Lead Score' },
   { id: 'leads', label: 'Leads' },
 ]
@@ -21,6 +23,7 @@ export default function App() {
   const [page, setPage] = useState('upload')
   const [analise, setAnalise] = useState(null) // { id, meta, stats }
   const [mobileOpen, setMobileOpen] = useState(false)
+  const [baseCaptacao, setBaseCaptacao] = useState(null) // base recém-enviada pra pontuar
   const { theme, toggleTheme, sidebarCollapsed } = useTheme()
   const isDark = theme === 'dark'
 
@@ -82,9 +85,16 @@ export default function App() {
       )}
 
       <main className={`transition-[padding] duration-200 ${sidebarCollapsed ? 'lg:pl-16' : 'lg:pl-64'}`}>
-        {page === 'upload' && <UploadPage onConcluir={aoConcluirAnalise} irParaBases={() => setPage('bases')} />}
+        {page === 'upload' && (
+          <UploadPage
+            onConcluir={aoConcluirAnalise}
+            onPontuar={(id) => { setBaseCaptacao(id); setPage('captacao') }}
+            irParaBases={() => setPage('bases')}
+          />
+        )}
         {page === 'bases' && <DatasetsPage onAbrirAnalise={aoConcluirAnalise} irParaUpload={() => setPage('upload')} />}
         {page === 'modelo' && <ModeloPage irParaBases={() => setPage('bases')} />}
+        {page === 'captacao' && <CaptacaoPage baseInicial={baseCaptacao} irParaUpload={() => setPage('upload')} />}
         {page === 'analise' && <AnalysisPage analise={analise} irParaUpload={() => setPage('upload')} />}
         {page === 'leads' && <LeadsPage analise={analise} irParaUpload={() => setPage('upload')} />}
       </main>

@@ -40,6 +40,8 @@ export interface Mapeamento {
   nome?: string | null
   data?: string | null
   perguntas: string[]
+  /** colunas de contexto (UTMs de campanha/criativo): só análise, fora do modelo */
+  extras?: string[]
 }
 
 export interface LeadRow {
@@ -52,7 +54,11 @@ export interface LeadRow {
   data_lead: string
   respostas: Record<string, string | null>
   respondeu: boolean
+  extras: Record<string, string>
 }
+
+/** A origem (utm_source) vem do cadastro, não da pesquisa: não conta como "respondeu". */
+const ORIGEM_DO_LEAD = /utm_source|^origem do lead/i
 
 const texto = (v: unknown): string => (v === null || v === undefined ? '' : String(v).trim())
 
@@ -71,7 +77,13 @@ export function prepararLead(
   for (const p of mapa.perguntas) {
     const v = texto(linha[p])
     respostas[p] = v || null
-    if (v) respondeu = true
+    if (v && !ORIGEM_DO_LEAD.test(p)) respondeu = true
+  }
+
+  const extras: Record<string, string> = {}
+  for (const col of mapa.extras ?? []) {
+    const v = texto(linha[col]).toLowerCase()
+    if (v) extras[col] = v
   }
 
   return {
@@ -84,5 +96,29 @@ export function prepararLead(
     data_lead: mapa.data ? texto(linha[mapa.data]) : '',
     respostas,
     respondeu,
+    extras,
   }
+}
+
+// ---------------------------------------------------------------------------
+// Nomes padrão das perguntas. Listas de lançamentos diferentes trazem a mesma
+// pergunta com redação diferente ("Idade" / "Qual a sua idade?"); o modelo só
+// reconhece o mesmo nome, então tudo é padronizado ao concluir o upload.
+// ---------------------------------------------------------------------------
+export const PERGUNTA_ORIGEM = 'Origem do lead (utm_source)'
+
+const PADRONIZAR: [RegExp, string][] = [
+  [/^(qual a sua )?idade\??$/, 'Idade'],
+  [/^é bacharel ou estudante de direito ?\??$/, 'É bacharel ou estudante de Direito?'],
+  [/^já fez a prova da oab antes\??$/, 'Já fez a prova da OAB antes?'],
+  [/^há quanto tempo estuda pra oab\??$/, 'Há quanto tempo estuda pra OAB?'],
+  [/^é ou já foi aluno vde oab\??$/, 'É ou já foi aluno VDE OAB?'],
+  [/^há quanto tempo conhece o método vde\??$/, 'Há quanto tempo conhece o Método VDE?'],
+  [/^(ao final do aulão gratuito.*|pretende entrar na turma.*)$/, 'Pretende entrar na turma do lançamento?'],
+  [/^utm_source$/, PERGUNTA_ORIGEM],
+]
+
+export function nomePadrao(coluna: string): string {
+  const k = coluna.trim().toLowerCase().replace(/\s+/g, ' ')
+  return PADRONIZAR.find(([re]) => re.test(k))?.[1] ?? coluna
 }

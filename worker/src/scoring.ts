@@ -199,3 +199,191 @@ export function calcularModeloCombinado(agregados: AgregadoBase[], resumos: Resu
     parametros: { hot: HOT, warm: WARM, suavizacao: SUAVIZACAO, min_amostra: MIN_AMOSTRA },
   }
 }
+
+// ---------------------------------------------------------------------------
+// Regressão logística (L2) — substitui a soma de pesos como modelo de score.
+//
+// Por que: a soma de pesos trata as perguntas como independentes e conta duas
+// vezes a mesma informação quando elas se sobrepõem. A logística aprende todos
+// os pesos juntos e já devolve uma probabilidade de compra calibrada.
+//
+// Mesma forma de uso do modelo antigo: o score do lead continua sendo a soma
+// dos pesos das respostas (aqui, coeficientes), então o SQL de percentil/classe
+// não muda. A probabilidade é sigmoid(intercepto + soma).
+// ---------------------------------------------------------------------------
+
+export interface LinhaTreino {
+  dataset_id: string
+  respostas: Record<string, string | null>
+  comprou: boolean
+}
+
+export interface Logistica {
+  /** coeficientes por pergunta/resposta (mesmo formato de Modelo.pesos) */
+  pesos: Record<string, Record<string, number>>
+  /** intercepto de cada base + '*' (média ponderada, usada em lançamentos novos) */
+  interceptos: Record<string, number>
+  /** C escolhido por validação cruzada (maior C = menos regularização) */
+  c: number
+}
+
+export const GRADE_C = [0.03, 0.1, 0.3, 1, 3, 10]
+const DOBRAS = 5
+
+function mulberry32(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+/** Resolve A x = b (A simétrica positiva) por eliminação gaussiana com pivô. */
+function resolver(A: number[][], b: number[]): number[] {
+  const n = b.length
+  const M = A.map((l, i) => [...l, b[i]])
+  for (let i = 0; i < n; i++) {
+    let p = i
+    for (let r = i + 1; r < n; r++) if (Math.abs(M[r][i]) > Math.abs(M[p][i])) p = r
+    ;[M[i], M[p]] = [M[p], M[i]]
+    const d = M[i][i] || 1e-12
+    for (let r = i + 1; r < n; r++) {
+      const f = M[r][i] / d
+      if (f) for (let c = i; c <= n; c++) M[r][c] -= f * M[i][c]
+    }
+  }
+  const x = new Array<number>(n).fill(0)
+  for (let i = n - 1; i >= 0; i--) {
+    let s = M[i][n]
+    for (let c = i + 1; c < n; c++) s -= M[i][c] * x[c]
+    x[i] = s / (M[i][i] || 1e-12)
+  }
+  return x
+}
+
+interface Padrao {
+  ativos: number[] // colunas ativas (1 da base + 1 por pergunta)
+  n: number[] // leads por dobra
+  k: number[] // compras por dobra
+}
+
+/** Newton-Raphson para minimizar logloss*soma + (1/(2C))·‖w penalizado‖². */
+function ajustar(padroes: Padrao[], dobraFora: number, p: number, nPen0: number, C: number): number[] {
+  const lambda = 1 / C
+  const w = new Array<number>(p).fill(0)
+  const nTreino = padroes.map((pd) => pd.n.reduce((s, v, f) => (f === dobraFora ? s : s + v), 0))
+  const kTreino = padroes.map((pd) => pd.k.reduce((s, v, f) => (f === dobraFora ? s : s + v), 0))
+
+  for (let it = 0; it < 30; it++) {
+    const g = new Array<number>(p).fill(0)
+    const H = Array.from({ length: p }, () => new Array<number>(p).fill(0))
+    for (let i = 0; i < padroes.length; i++) {
+      const n = nTreino[i]
+      if (!n) continue
+      const a = padroes[i].ativos
+      let z = 0
+      for (const j of a) z += w[j]
+      const pr = 1 / (1 + Math.exp(-z))
+      const gr = n * pr - kTreino[i]
+      const h = n * pr * (1 - pr)
+      for (const j of a) {
+        g[j] += gr
+        for (const l of a) H[j][l] += h
+      }
+    }
+    for (let j = nPen0; j < p; j++) {
+      g[j] += lambda * w[j]
+      H[j][j] += lambda
+    }
+    for (let j = 0; j < nPen0; j++) H[j][j] += 1e-9
+    const delta = resolver(H, g)
+    let maior = 0
+    for (let j = 0; j < p; j++) {
+      w[j] -= delta[j]
+      maior = Math.max(maior, Math.abs(delta[j]))
+    }
+    if (maior < 1e-7) break
+  }
+  return w
+}
+
+export function treinarLogistica(linhas: LinhaTreino[], perguntas: string[]): Logistica {
+  const bases = [...new Set(linhas.map((l) => l.dataset_id))].sort()
+  const idxBase = new Map(bases.map((b, i) => [b, i]))
+
+  // colunas: 1 intercepto por base (sem penalização) + 1 por (pergunta, resposta)
+  const nomes: { pergunta: string; resposta: string }[] = []
+  const idxResp = new Map<string, number>()
+  const resposta = (l: LinhaTreino, q: string) => (l.respostas[q] ?? '').toString().trim() || SEM_RESPOSTA
+  for (const l of linhas) {
+    for (const q of perguntas) {
+      const chave = `${q}\u0000${resposta(l, q)}`
+      if (!idxResp.has(chave)) {
+        idxResp.set(chave, bases.length + nomes.length)
+        nomes.push({ pergunta: q, resposta: resposta(l, q) })
+      }
+    }
+  }
+  const p = bases.length + nomes.length
+
+  // agrupa leads idênticos (mesma base e mesmas respostas) → treino muito mais rápido
+  const rng = mulberry32(20260507)
+  const mapa = new Map<string, Padrao>()
+  for (const l of linhas) {
+    const ativos = [idxBase.get(l.dataset_id)!, ...perguntas.map((q) => idxResp.get(`${q}\u0000${resposta(l, q)}`)!)]
+    const chave = ativos.join(',')
+    let pd = mapa.get(chave)
+    if (!pd) mapa.set(chave, (pd = { ativos, n: new Array(DOBRAS).fill(0), k: new Array(DOBRAS).fill(0) }))
+    const f = Math.floor(rng() * DOBRAS)
+    pd.n[f]++
+    if (l.comprou) pd.k[f]++
+  }
+  const padroes = [...mapa.values()]
+
+  // escolhe C: menor logloss fora da dobra, média das 5 dobras
+  let melhorC = GRADE_C[0]
+  let melhorPerda = Infinity
+  for (const C of GRADE_C) {
+    let perda = 0
+    let total = 0
+    for (let f = 0; f < DOBRAS; f++) {
+      const w = ajustar(padroes, f, p, bases.length, C)
+      for (const pd of padroes) {
+        const n = pd.n[f]
+        if (!n) continue
+        let z = 0
+        for (const j of pd.ativos) z += w[j]
+        const pr = Math.min(Math.max(1 / (1 + Math.exp(-z)), 1e-9), 1 - 1e-9)
+        perda -= pd.k[f] * Math.log(pr) + (n - pd.k[f]) * Math.log(1 - pr)
+        total += n
+      }
+    }
+    perda /= total || 1
+    if (perda < melhorPerda) {
+      melhorPerda = perda
+      melhorC = C
+    }
+  }
+
+  const w = ajustar(padroes, -1, p, bases.length, melhorC)
+  const pesos: Record<string, Record<string, number>> = {}
+  for (const q of perguntas) pesos[q] = {}
+  nomes.forEach((nm, i) => {
+    pesos[nm.pergunta][nm.resposta] = w[bases.length + i]
+  })
+
+  const porBase = new Map<string, number>()
+  for (const l of linhas) porBase.set(l.dataset_id, (porBase.get(l.dataset_id) ?? 0) + 1)
+  const interceptos: Record<string, number> = {}
+  let soma = 0
+  bases.forEach((b, i) => {
+    interceptos[b] = w[i]
+    soma += w[i] * (porBase.get(b) ?? 0)
+  })
+  interceptos['*'] = soma / (linhas.length || 1)
+
+  return { pesos, interceptos, c: melhorC }
+}

@@ -2,7 +2,7 @@ import { useEffect, useMemo, useState } from 'react'
 import {
   Boxes, Loader2, AlertTriangle, Check, Download, RefreshCw, Target, TrendingUp,
 } from 'lucide-react'
-import { getDatasets, getModelos, criarModelo, urlPesosModelo } from '../lib/api.js'
+import { getDatasets, getModelos, criarModelo, urlPesosModelo, urlExportModelo } from '../lib/api.js'
 
 /**
  * Modelo combinado.
@@ -180,9 +180,17 @@ export default function ModeloPage({ irParaBases }) {
                   taxa base {fmtPct(resultado.stats.taxa_base)} · {resultado.stats.perguntas.length} perguntas no modelo
                 </p>
               </div>
-              <a className="btn-ghost" href={urlPesosModelo(resultado.id)}>
-                <Download size={15} /> Pesos (JSON)
-              </a>
+              <div className="flex flex-wrap gap-2">
+                <a className="btn-primary" href={urlExportModelo(resultado.id, 'hot')} download>
+                  <Download size={15} /> Leads hot com probabilidade (CSV)
+                </a>
+                <a className="btn-ghost" href={urlExportModelo(resultado.id)} download>
+                  <Download size={15} /> Todos (CSV)
+                </a>
+                <a className="btn-ghost" href={urlPesosModelo(resultado.id)}>
+                  <Download size={15} /> Pesos (JSON)
+                </a>
+              </div>
             </div>
 
             <div className="mt-4 grid gap-2 sm:grid-cols-2 lg:grid-cols-4">

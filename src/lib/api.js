@@ -194,6 +194,21 @@ export function urlPesosModelo(id) {
   return `/api/modelos/${id}/pesos${token ? `?token=${encodeURIComponent(token)}` : ''}`
 }
 
+/** CSV com os leads do modelo (todas as bases) e a probabilidade de compra de cada um. */
+export function urlExportModelo(id, classe, datasetId) {
+  const qs = new URLSearchParams()
+  if (datasetId) qs.set('dataset_id', datasetId)
+  if (classe) qs.set('classe', classe)
+  const token = getToken()
+  if (token) qs.set('token', token)
+  const s = qs.toString()
+  return `/api/modelos/${id}/export${s ? `?${s}` : ''}`
+}
+
+/** Pontua uma base (com ou sem compradores) com um modelo e devolve o painel da captação. */
+export const pontuarCaptacao = ({ modelo_id, dataset_id, taxa_alvo }) =>
+  postar('/api/captacao', { modelo_id, dataset_id, ...(taxa_alvo ? { taxa_alvo } : {}) })
+
 export const getAnalises = () => pegar('/api/analises')
 
 export const getAnalise = (id) => pegar(`/api/analises/${id}`)

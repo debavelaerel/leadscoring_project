@@ -20,6 +20,7 @@ const PAPEIS = [
   { id: 'nome',     label: 'Nome' },
   { id: 'data',     label: 'Data de cadastro' },
   { id: 'pergunta', label: 'Pergunta da pesquisa' },
+  { id: 'dimensao', label: 'Campanha / UTM (só análise)' },
 ]
 
 function sugerirPapel(coluna, valores) {
@@ -28,6 +29,10 @@ function sugerirPapel(coluna, valores) {
   if (c.includes('telefone') || c.includes('phone') || c.includes('celular') || c === 'tel') return 'telefone'
   if (c === 'nome' || c === 'name' || c.includes('nome completo')) return 'nome'
   if (c.includes('created') || c.includes('data de') || c === 'data' || c === 'date') return 'data'
+  // a origem do lead entra no modelo (é um dos melhores sinais); as demais UTMs não
+  if (c === 'utm_source') return 'pergunta'
+  // campanha, criativo, público: não entram no modelo, mas alimentam a tela Captação
+  if (['utm_medium', 'utm_campaign', 'utm_content', 'utm_term'].includes(c)) return 'dimensao'
   if (c.startsWith('utm') || c === 'xcode' || c.includes('gclid') || c.includes('fbclid')) return 'ignorar'
   // heurística: pouca cardinalidade na amostra → pergunta fechada;
   // muitas respostas distintas → texto aberto (não entra no modelo de pesos)
@@ -45,7 +50,7 @@ const ETAPAS = {
   concluido: 'Cruzando com os compradores…',
 }
 
-export default function UploadPage({ onConcluir, irParaBases }) {
+export default function UploadPage({ onConcluir, onPontuar, irParaBases }) {
   const inputRef = useRef(null)
   const [arquivo, setArquivo] = useState(null)
   const [colunas, setColunas] = useState([])       // [{nome, amostra:[], papel}]
@@ -109,6 +114,7 @@ export default function UploadPage({ onConcluir, irParaBases }) {
     nome: colunas.find((c) => c.papel === 'nome')?.nome || null,
     data: colunas.find((c) => c.papel === 'data')?.nome || null,
     perguntas: colunas.filter((c) => c.papel === 'pergunta').map((c) => c.nome),
+    extras: colunas.filter((c) => c.papel === 'dimensao').map((c) => c.nome),
   }), [colunas])
 
   // uma captação vende vários produtos: comprou = entrou em qualquer turma marcada
@@ -150,6 +156,35 @@ export default function UploadPage({ onConcluir, irParaBases }) {
       onConcluir(resultado)
     } catch (e) {
       if (e.status === 409 && e.corpo?.dataset) setDuplicado(e.corpo.dataset)
+      else setErro(e.message)
+    } finally {
+      setProcessando(false)
+      setProgresso(null)
+    }
+  }
+
+  // captação em andamento: sobe a lista sem cruzar com compradores e vai direto pra tela Captação
+  const prontoParaPontuar = arquivo && mapeamento.email && mapeamento.perguntas.length > 0
+  const soPontuar = async () => {
+    if (!prontoParaPontuar || processando) return
+    setProcessando(true)
+    setErro(null)
+    setDuplicado(null)
+    setProgresso({ etapa: 'preparando', pct: 0 })
+    const principal = turmasEscolhidas[0]
+    try {
+      const base = await enviarBase({
+        arquivo,
+        mapeamento,
+        oab: principal?.oab,
+        curso: principal?.curso,
+        nome: arquivo.name.replace(/\.csv$/i, ''),
+        colunas: colunas.map((c) => c.nome),
+        onProgresso: setProgresso,
+      })
+      onPontuar?.(base.id)
+    } catch (e) {
+      if (e.status === 409 && e.corpo?.dataset) onPontuar?.(e.corpo.dataset.id)
       else setErro(e.message)
     } finally {
       setProcessando(false)
@@ -367,7 +402,15 @@ export default function UploadPage({ onConcluir, irParaBases }) {
       )}
 
       {colunas.length > 0 && (
-        <div className="mt-6 flex justify-end">
+        <div className="mt-6 flex flex-wrap items-center justify-end gap-3">
+          <button
+            className="btn-ghost !px-5 !py-2.5"
+            disabled={!prontoParaPontuar || processando}
+            onClick={soPontuar}
+            title="Para uma captação em andamento, ainda sem compradores: pontua os leads com um modelo já treinado"
+          >
+            Só pontuar a captação (sem compradores)
+          </button>
           <button className="btn-primary !px-6 !py-2.5" disabled={!pronto || processando} onClick={rodar}>
             {processando ? <Loader2 size={16} className="animate-spin" /> : <Play size={16} />}
             {processando ? 'Enviando e cruzando…' : 'Enviar base e rodar análise'}

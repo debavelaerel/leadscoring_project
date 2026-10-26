@@ -1,5 +1,5 @@
 import {
-  UploadCloud, Database, Boxes, Gauge, Users,
+  UploadCloud, Database, Boxes, Gauge, Users, Radar,
   ChevronLeft, ChevronRight, Sun, Moon,
 } from 'lucide-react'
 import { useTheme } from '../lib/theme.jsx'
@@ -10,12 +10,13 @@ const NAV = [
   { id: 'upload',  label: 'Nova análise', icon: UploadCloud },
   { id: 'bases',   label: 'Bases',        icon: Database },
   { id: 'modelo',  label: 'Modelo',       icon: Boxes },
+  { id: 'captacao', label: 'Captação',    icon: Radar },
   { id: 'analise', label: 'Lead Score',   icon: Gauge },
   { id: 'leads',   label: 'Leads',        icon: Users },
 ]
 
 // telas que não dependem de ter uma análise carregada
-const SEMPRE_LIBERADAS = new Set(['upload', 'bases', 'modelo'])
+const SEMPRE_LIBERADAS = new Set(['upload', 'bases', 'modelo', 'captacao'])
 
 export default function Sidebar({ current, onChange, temAnalise }) {
   const { theme, toggleTheme, sidebarCollapsed: collapsed, toggleSidebar } = useTheme()

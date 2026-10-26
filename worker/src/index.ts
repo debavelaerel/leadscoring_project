@@ -13,10 +13,10 @@
 import { Buffer } from 'node:buffer'
 import { Client } from 'pg'
 import { Env, abrirConexao, comBanco, tuplas } from './db'
-import { Mapeamento, prepararLead } from './etl'
+import { Mapeamento, PERGUNTA_ORIGEM, nomePadrao, prepararLead } from './etl'
 import {
   Agregado, AgregadoBase, ResumoBase,
-  calcularModelo, calcularModeloCombinado, MAX_RESPOSTAS,
+  LinhaTreino, calcularModelo, calcularModeloCombinado, treinarLogistica, MAX_RESPOSTAS, SEM_RESPOSTA,
 } from './scoring'
 
 interface Turma {
@@ -180,19 +180,19 @@ async function rotaLinhas(c: Client, req: Request, datasetId: string) {
   const { texto, valores } = tuplas(
     prontas.map((l) => [
       l.dataset_id, l.linha, l.nome, l.email, l.telefone_fmt,
-      l.tel_chaves, l.data_lead, JSON.stringify(l.respostas), l.respondeu,
+      l.tel_chaves, l.data_lead, JSON.stringify(l.respostas), l.respondeu, JSON.stringify(l.extras),
     ]),
   )
 
   await c.query(
     `insert into leadscore.leads
-       (dataset_id, linha, nome, email, telefone_fmt, tel_chaves, data_lead, respostas, respondeu)
+       (dataset_id, linha, nome, email, telefone_fmt, tel_chaves, data_lead, respostas, respondeu, extras)
      values ${texto}
      on conflict (dataset_id, linha) do update
         set nome = excluded.nome, email = excluded.email,
             telefone_fmt = excluded.telefone_fmt, tel_chaves = excluded.tel_chaves,
             data_lead = excluded.data_lead, respostas = excluded.respostas,
-            respondeu = excluded.respondeu`,
+            respondeu = excluded.respondeu, extras = excluded.extras`,
     valores,
   )
   return json({ inseridas: prontas.length })
@@ -200,12 +200,68 @@ async function rotaLinhas(c: Client, req: Request, datasetId: string) {
 
 async function rotaConcluirDataset(c: Client, req: Request, datasetId: string) {
   const corpo = (await req.json().catch(() => ({}))) as { total_linhas?: number; erro?: string }
+  let total = corpo.total_linhas ?? 0
+
+  if (!corpo.erro) {
+    const dataset = await pegarDataset(c, datasetId)
+
+    // 1) padroniza o nome das perguntas (listas de lançamentos diferentes usam redações diferentes)
+    const renomear: Record<string, string> = {}
+    const perguntas = (dataset.mapeamento?.perguntas || []).map((p: string) => {
+      const n = nomePadrao(p)
+      if (n !== p) renomear[p] = n
+      return n
+    })
+    if (Object.keys(renomear).length) {
+      await c.query(
+        `update leadscore.leads l
+            set respostas = (
+              select coalesce(jsonb_object_agg(coalesce($2::jsonb ->> e.key, e.key), e.value), '{}'::jsonb)
+                from jsonb_each(l.respostas) e)
+          where dataset_id = $1`,
+        [datasetId, JSON.stringify(renomear)],
+      )
+      await c.query(
+        `update leadscore.datasets set mapeamento = jsonb_set(mapeamento, '{perguntas}', $2::jsonb) where id = $1`,
+        [datasetId, JSON.stringify(perguntas)],
+      )
+    }
+
+    // 2) a origem vira minúscula e sem espaços, pra "Meta-Ads" e "meta-ads" serem a mesma resposta
+    if (perguntas.includes(PERGUNTA_ORIGEM)) {
+      await c.query(
+        `update leadscore.leads
+            set respostas = jsonb_set(respostas, array[$2::text], to_jsonb(lower(trim(respostas ->> $2::text))))
+          where dataset_id = $1 and nullif(trim(respostas ->> $2::text), '') is not null`,
+        [datasetId, PERGUNTA_ORIGEM],
+      )
+    }
+
+    // 3) só leads únicos: um por e-mail (sem e-mail, por telefone). Entre repetidos fica o
+    //    cadastro com mais perguntas respondidas; empate, o primeiro da lista.
+    await c.query(
+      `delete from leadscore.leads l
+        using (
+          select id, row_number() over (
+                   partition by dataset_id, coalesce(email, tel_chaves[1], id::text)
+                   order by (select count(*) from jsonb_each_text(respostas) e
+                              where nullif(trim(e.value), '') is not null
+                                and e.key !~* 'utm_source|^origem do lead') desc,
+                            linha) as rn
+            from leadscore.leads where dataset_id = $1
+        ) d
+        where l.id = d.id and d.rn > 1`,
+      [datasetId],
+    )
+    total = (await c.query('select count(*)::int as n from leadscore.leads where dataset_id = $1', [datasetId])).rows[0].n
+  }
+
   const { rows } = await c.query(
     `update leadscore.datasets
         set status = $2, erro = $3, total_linhas = $4
       where id = $1
       returning *`,
-    [datasetId, corpo.erro ? 'erro' : 'pronto', corpo.erro ?? null, corpo.total_linhas ?? 0],
+    [datasetId, corpo.erro ? 'erro' : 'pronto', corpo.erro ?? null, total],
   )
   if (!rows.length) throw new ErroHttp(404, 'Base não encontrada.')
   return json({ dataset: rows[0] })
@@ -291,6 +347,14 @@ async function rotaCriarAnalise(c: Client, req: Request) {
     respondeu_pesquisa: number
   }
   if (!resumo || !resumo.total_leads) throw new ErroHttp(400, 'Base sem leads carregados.')
+  // sem compradores todo peso vira zero e a análise apagaria o score da base (todos viram "cold")
+  if (!resumo.total_compras) {
+    throw new ErroHttp(
+      400,
+      'Nenhum lead desta base casou com compradores das turmas escolhidas, então não há o que aprender. ' +
+        'Para pontuar uma base ainda sem vendas, use um modelo já treinado (CSV do modelo com ?dataset_id=).',
+    )
+  }
 
   const agregados: Agregado[] = fechadas.length
     ? (await c.query('select pergunta, resposta, leads, compras from leadscore.ls_agregados($1,$2)', [
@@ -309,6 +373,8 @@ async function rotaCriarAnalise(c: Client, req: Request) {
   const aplicado = (
     await c.query('select leadscore.ls_aplicar_pesos($1,$2) as r', [dataset.id, JSON.stringify(modelo.pesos)])
   ).rows[0].r as { faixas_score: unknown[]; classes: Record<string, unknown> }
+  // a soma de pesos não tem probabilidade: não deixa sobrar a de um modelo anterior
+  await c.query('update leadscore.leads set prob = null where dataset_id = $1', [dataset.id])
 
   const stats = {
     total_leads: resumo.total_leads,
@@ -375,7 +441,14 @@ async function rotaCriarAnalise(c: Client, req: Request) {
  * pontuando ela. Sem isso, todo número é in-sample e parece melhor do que é.
  */
 async function rotaCriarModelo(c: Client, req: Request) {
-  const corpo = (await req.json()) as { nome?: string; datasets?: string[]; perguntas?: string[] }
+  const corpo = (await req.json()) as {
+    nome?: string
+    datasets?: string[]
+    perguntas?: string[]
+    /** 'regressao_logistica' (padrão) ou 'soma_de_pesos' (modelo antigo, pra comparar) */
+    metodo?: string
+  }
+  const metodo = corpo.metodo === 'soma_de_pesos' ? 'soma_de_pesos' : 'regressao_logistica'
   const datasets = [...new Set((corpo.datasets || []).filter(Boolean))]
   if (!datasets.length) throw new ErroHttp(400, 'Selecione ao menos uma base.')
 
@@ -429,28 +502,77 @@ async function rotaCriarModelo(c: Client, req: Request) {
 
   const modelo = calcularModeloCombinado(agregados, resumos)
 
-  const aplicado = (
-    await c.query('select leadscore.ls_aplicar_pesos_multi($1,$2) as r', [datasets, JSON.stringify(modelo.pesos)])
-  ).rows[0].r as { faixas_score: unknown[]; classes: Record<string, unknown> }
+  // pesos que realmente pontuam: coeficientes da logística (padrão) ou a soma de pesos antiga
+  const { rows: linhasRaw } = await c.query(
+    'select dataset_id, respostas, comprou from leadscore.leads where dataset_id = any($1)',
+    [datasets],
+  )
+  const linhas: LinhaTreino[] = linhasRaw
+  const treinar = (dsets: string[]) => {
+    if (metodo === 'soma_de_pesos') {
+      const m = calcularModeloCombinado(
+        agregados.filter((a) => dsets.includes(a.dataset_id)),
+        resumos.filter((r) => dsets.includes(r.dataset_id)),
+      )
+      return { pesos: m.pesos, interceptos: undefined as Record<string, number> | undefined, c: undefined as number | undefined }
+    }
+    return treinarLogistica(linhas.filter((l) => dsets.includes(l.dataset_id)), fechadas)
+  }
+  const final = treinar(datasets)
+  if (metodo === 'regressao_logistica') {
+    // a tela mostra o "peso" de cada resposta: aqui passa a ser o coeficiente da logística
+    for (const pg of modelo.perguntas) {
+      for (const r of pg.respostas) r.peso = Math.round((final.pesos[pg.pergunta]?.[r.resposta] ?? 0) * 10000) / 10000
+    }
+  }
+  modelo.pesos = final.pesos
+
+  let aplicado = await aplicarModelo(c, datasets, final.pesos, final.interceptos, null)
+  let referencia: number[] | null = null
+  let probMediaTreino: number | null = null
+  if (final.interceptos) {
+    // nota absoluta: o score passa a medir o lead contra a distribuição dos leads de treino
+    ;({ referencia, media: probMediaTreino } = await referenciaDeProb(c, datasets))
+    aplicado = await aplicarModelo(c, datasets, final.pesos, final.interceptos, referencia)
+  }
 
   // --- validação -------------------------------------------------------------
   const validar = async (dataset: string, pesos: unknown) =>
     (await c.query('select leadscore.ls_validar($1,$2) as r', [dataset, JSON.stringify(pesos)])).rows[0].r
 
   const validacao: unknown[] = []
+  // previsões de cada base feitas por um modelo que NÃO a viu: é assim que a chance se comporta num lançamento novo
+  const foraDaBase: { p: number; y: boolean }[] = []
   for (const d of datasets) {
-    const dentro = await validar(d, modelo.pesos)
+    const dentro = await validar(d, final.pesos)
     let fora = null
     if (datasets.length >= 2) {
-      // treina sem esta base e pontua ela — acurácia honesta
-      const treino = calcularModeloCombinado(
-        agregados.filter((a) => a.dataset_id !== d),
-        resumos.filter((r) => r.dataset_id !== d),
-      )
+      // treina sem esta base (inclusive a escolha do C) e pontua ela — acurácia honesta
+      const treino = treinar(datasets.filter((x) => x !== d))
       fora = await validar(d, treino.pesos)
+      if (treino.interceptos) {
+        const b0 = treino.interceptos['*']
+        for (const l of linhas) {
+          if (l.dataset_id !== d) continue
+          let z = b0
+          for (const q of fechadas) z += treino.pesos[q]?.[(l.respostas[q] ?? '').toString().trim() || SEM_RESPOSTA] ?? 0
+          foraDaBase.push({ p: 1 / (1 + Math.exp(-z)), y: l.comprou })
+        }
+      }
     }
     validacao.push({ dataset_id: d, base: nomeDaBase.get(d), dentro_da_amostra: dentro, fora_da_amostra: fora })
   }
+
+  // Teto da chance exibida. Acima de ~40% a previsão sai otimista em lançamento novo (previu 45%, comprou 38%),
+  // e um calibrador ajustado em um lançamento não se sustenta no outro. Então a chance mostrada nunca passa da
+  // taxa que de fato comprou entre os leads que o modelo pontuou acima do corte. Não muda a ordem dos leads.
+  const CORTE_TETO = 0.4
+  const acimaDoCorte = foraDaBase.filter((x) => x.p >= CORTE_TETO)
+  const taxaAcima = acimaDoCorte.length ? acimaDoCorte.filter((x) => x.y).length / acimaDoCorte.length : null
+  const tetoProb =
+    acimaDoCorte.length >= 30 && taxaAcima !== null && taxaAcima < CORTE_TETO
+      ? Math.round(taxaAcima * 100) / 100
+      : null
 
   const stats = {
     total_leads: resumos.reduce((s, r) => s + r.total_leads, 0),
@@ -462,7 +584,17 @@ async function rotaCriarModelo(c: Client, req: Request) {
     impulsionadores: modelo.impulsionadores,
     faixas_score: aplicado?.faixas_score || [],
     classes: aplicado?.classes || {},
-    parametros: modelo.parametros,
+    parametros: {
+      ...modelo.parametros,
+      metodo,
+      ...(final.c !== undefined ? { c_regularizacao: final.c } : {}),
+    },
+    interceptos: final.interceptos ?? null,
+    referencia,
+    prob_media_treino: probMediaTreino,
+    teto_prob: tetoProb,
+    teto_corte: CORTE_TETO,
+    teto_amostra: acimaDoCorte.length,
     bases: resumos.map((r) => ({
       dataset_id: r.dataset_id,
       nome: nomeDaBase.get(r.dataset_id),
@@ -503,17 +635,64 @@ async function rotaModelo(c: Client, id: string) {
   return json({ modelo: rows[0] })
 }
 
-/** Os pesos em JSON — é este arquivo que alimenta o Optimiz. */
+/** utm_source → grupo. O nome da origem muda de um lançamento para outro; o grupo é o que o modelo usa. */
+const GRUPOS_ORIGEM: Record<string, string> = {
+  'meta-ads': 'pago', 'google-ads': 'pago', pago: 'pago',
+  instagram: 'organico', site: 'organico', organico: 'organico', org: 'organico',
+  whatsapp: 'base propria', email: 'base propria',
+}
+
+/**
+ * O modelo completo em JSON — é este arquivo que alimenta o Optimiz.
+ * Traz tudo o que é preciso para reproduzir o score igual ao desta tela, sem depender do nosso banco:
+ * pesos, intercepto, tabela de nota, teto, cortes e a regra de agrupamento da origem.
+ */
 async function rotaPesosDoModelo(c: Client, id: string) {
-  const { rows } = await c.query('select nome, perguntas, pesos, criado_em from leadscore.modelos where id = $1', [id])
+  const { rows } = await c.query('select id, nome, perguntas, pesos, criado_em, stats, validacao from leadscore.modelos where id = $1', [id])
   if (!rows.length) throw new ErroHttp(404, 'Modelo não encontrado.')
+  const m = rows[0]
+  const logistica = Boolean(m.stats?.interceptos && m.stats?.referencia)
+  const perguntaOrigem = ((m.perguntas || []) as string[]).find((p) => /utm_source/i.test(p)) ?? 'Origem do lead (utm_source)'
+  const perguntaGrupo = ((m.perguntas || []) as string[]).find((p) => /\(grupo\)/i.test(p)) ?? null
+  const aucs = ((m.validacao || []) as any[]).map((v) => v?.fora_da_amostra?.auc).filter((a) => typeof a === 'number')
   const corpo = JSON.stringify(
     {
-      modelo: rows[0].nome,
-      gerado_em: rows[0].criado_em,
-      parametros: { hot: 80, warm: 50, suavizacao: 5 },
-      perguntas: rows[0].perguntas,
-      pesos: rows[0].pesos,
+      formato: 'leadscore-modelo/2',
+      modelo: m.nome,
+      id: m.id,
+      gerado_em: m.criado_em,
+      parametros: { hot: 80, warm: 50 },
+      perguntas: m.perguntas,
+      pesos: m.pesos,
+      // --- o que falta para reproduzir o score (só modelos de regressão logística) ---
+      ...(logistica
+        ? {
+            resposta_em_branco: SEM_RESPOSTA,
+            resposta_desconhecida: { peso: 0 },
+            intercepto: m.stats.interceptos['*'],
+            probabilidade: '1 / (1 + exp(-(intercepto + soma dos pesos das respostas do lead)))',
+            teto_probabilidade: Number(m.stats.teto_prob) > 0 ? Number(m.stats.teto_prob) : 1,
+            nota: {
+              regra: 'nota = min(100, max(0, quantos valores de `quantis` são <= probabilidade, menos 1)). Usa a probabilidade SEM o teto.',
+              quantis: (m.stats.referencia as unknown[]).map(Number),
+            },
+            classes: 'hot se nota >= parametros.hot; warm se nota >= parametros.warm; senão cold',
+            ...(perguntaGrupo
+              ? {
+                  origem: {
+                    pergunta_origem: perguntaOrigem,
+                    pergunta_grupo: perguntaGrupo,
+                    regra: 'minúsculas e sem espaços nas pontas; vazio = em branco; fora do mapa = "outro"',
+                    mapa: GRUPOS_ORIGEM,
+                    padrao: 'outro',
+                  },
+                }
+              : {}),
+            validacao_fora_da_amostra: aucs.length
+              ? { auc_medio: Math.round((aucs.reduce((s, a) => s + a, 0) / aucs.length) * 1000) / 1000, bases: aucs.length }
+              : null,
+          }
+        : { aviso: 'Modelo da versão antiga (soma de pesos, sem probabilidade). Treine de novo para exportar o modelo completo.' }),
     },
     null,
     2,
@@ -590,6 +769,7 @@ const leadPublico = (l: any) => ({
   comprou_em: l.comprou_em || [],
   match_via: l.match_via,
   score: l.score,
+  prob: l.prob === null || l.prob === undefined ? null : Math.round(Number(l.prob) * 10000) / 10000,
   classe: l.classe,
 })
 
@@ -603,7 +783,7 @@ async function rotaLeads(c: Client, id: string, url: URL) {
     (await c.query(`select count(*)::int as n from leadscore.leads where ${where}`, valores)).rows[0].n,
   )
   const { rows } = await c.query(
-    `select linha, nome, email, telefone_fmt, data_lead, respostas, respondeu, comprou, comprou_em, match_via, score, classe
+    `select linha, nome, email, telefone_fmt, data_lead, respostas, respondeu, comprou, comprou_em, match_via, score, prob, classe
        from leadscore.leads
       where ${where}
       order by score desc nulls last, linha asc
@@ -696,6 +876,425 @@ async function rotaExport(env: Env, id: string, url: URL) {
   })
 }
 
+/**
+ * Export dos leads de um modelo (todas as bases dele) com a probabilidade de compra.
+ * Reaplica o modelo antes, pra score/classe/probabilidade serem exatamente os dele
+ * (a tabela de leads guarda só o último modelo ou análise aplicado).
+ */
+async function rotaExportModelo(env: Env, id: string, url: URL) {
+  const c = await abrirConexao(env)
+  let m: any
+  try {
+    const { rows } = await c.query('select * from leadscore.modelos where id = $1', [id])
+    if (!rows.length) throw new ErroHttp(404, 'Modelo não encontrado.')
+    m = rows[0]
+    // ?dataset_id=… pontua OUTRA base (ex.: lançamento novo, ainda sem compradores) com este modelo
+    const outra = url.searchParams.get('dataset_id')
+    if (outra) {
+      await pegarDataset(c, outra)
+      m = { ...m, datasets: [outra] }
+    }
+    const interceptos = m.stats?.interceptos
+    await aplicarModelo(c, m.datasets, m.pesos, interceptos ?? null, m.stats?.referencia ?? null)
+  } catch (e) {
+    await c.end().catch(() => {})
+    throw e
+  }
+
+  const tetoExport = Number(m.stats?.teto_prob) > 0 ? Number(m.stats.teto_prob) : 1
+  const classe = url.searchParams.get('classe')
+  const filtroClasse = classe && ['hot', 'warm', 'cold'].includes(classe) ? classe : null
+  const perguntas = (m.perguntas || []) as string[]
+  const LOTE = 2000
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const enc = new TextEncoder()
+      controller.enqueue(enc.encode('\ufeff'))
+      controller.enqueue(
+        enc.encode(
+          ['base', 'nome', 'email', 'telefone', 'score', 'probabilidade', 'classe', 'comprou', ...perguntas]
+            .map(campoCsv)
+            .join(',') + '\n',
+        ),
+      )
+      let offset = 0
+      try {
+        for (;;) {
+          const { rows } = await c.query(
+            `select d.nome as base, l.nome, l.email, l.telefone_fmt, l.comprou, l.score, l.prob, l.classe, l.respostas
+               from leadscore.leads l
+               join leadscore.datasets d on d.id = l.dataset_id
+              where l.dataset_id = any($1) and ($2::text is null or l.classe = $2)
+              order by l.prob desc nulls last, l.score desc nulls last, l.dataset_id, l.linha
+              limit $3 offset $4`,
+            [m.datasets, filtroClasse, LOTE, offset],
+          )
+          for (const l of rows) {
+            controller.enqueue(
+              enc.encode(
+                [
+                  l.base,
+                  l.nome,
+                  l.email || '',
+                  l.telefone_fmt,
+                  l.score,
+                  l.prob === null ? '' : Math.min(Number(l.prob), tetoExport).toFixed(4),
+                  l.classe,
+                  l.comprou ? 'sim' : 'nao',
+                  ...perguntas.map((p) => l.respostas?.[p] || ''),
+                ]
+                  .map(campoCsv)
+                  .join(',') + '\n',
+              ),
+            )
+          }
+          if (rows.length < LOTE) break
+          offset += LOTE
+        }
+      } catch (e) {
+        controller.enqueue(enc.encode(`\n# erro ao exportar: ${(e as Error).message}\n`))
+      } finally {
+        await c.end().catch(() => {})
+        controller.close()
+      }
+    },
+    async cancel() {
+      await c.end().catch(() => {})
+    },
+  })
+
+  return new Response(stream, {
+    headers: {
+      'content-type': 'text/csv; charset=utf-8',
+      'content-disposition': `attachment; filename="leadscore_modelo${filtroClasse ? `_${filtroClasse}` : ''}.csv"`,
+      'cache-control': 'no-store',
+    },
+  })
+}
+
+type Aplicado = { faixas_score: any[]; classes: Record<string, any> }
+
+/** Grava score/prob/classe dos leads das bases com os pesos de um modelo. */
+async function aplicarModelo(
+  c: Client,
+  datasets: string[],
+  pesos: unknown,
+  interceptos: Record<string, number> | null | undefined,
+  referencia: number[] | null | undefined,
+): Promise<Aplicado> {
+  const { rows } = await c.query('select leadscore.ls_aplicar_pesos_multi($1,$2,$3,$4) as r', [
+    datasets,
+    JSON.stringify(pesos),
+    interceptos ? JSON.stringify(interceptos) : null,
+    referencia ? JSON.stringify(referencia) : null,
+  ])
+  return rows[0].r as Aplicado
+}
+
+/** 101 quantis (0..100) e a média da probabilidade dos leads já pontuados. */
+async function referenciaDeProb(c: Client, datasets: string[]): Promise<{ referencia: number[]; media: number }> {
+  const { rows } = await c.query(
+    `select percentile_cont(array(select g / 100.0 from generate_series(0, 100) g)) within group (order by prob) as q,
+            avg(prob)::float8 as media
+       from leadscore.leads where dataset_id = any($1) and prob is not null`,
+    [datasets],
+  )
+  return { referencia: (rows[0].q as number[]).map(Number), media: Number(rows[0].media) }
+}
+
+const arr4 = (x: unknown): number => Math.round(Number(x) * 10000) / 10000
+
+// t de Student bilateral 95% por graus de liberdade (1..10); acima disso, ≈ normal
+const T95 = [12.706, 4.303, 3.182, 2.776, 2.571, 2.447, 2.365, 2.306, 2.262, 2.228]
+
+/**
+ * Intervalo de previsão (95%) da taxa de conversão de um lançamento novo, a partir das taxas dos lançamentos de
+ * treino (meta-análise de efeitos aleatórios no logit, DerSimonian-Laird). Precisa de 3+ bases; senão devolve null.
+ */
+function intervaloNovoLancamento(bases: { n: number; x: number }[]): [number | null, number | null] {
+  const b = bases.filter((v) => v.n > 0 && v.x > 0 && v.x < v.n)
+  const k = b.length
+  if (k < 3) return [null, null]
+  const y = b.map((v) => Math.log(v.x / (v.n - v.x)))
+  const vr = b.map((v) => 1 / v.x + 1 / (v.n - v.x)) // variância do logit de uma proporção
+  const w = vr.map((s) => 1 / s)
+  const sw = w.reduce((s, v) => s + v, 0)
+  const muF = w.reduce((s, v, i) => s + v * y[i], 0) / sw
+  const Q = w.reduce((s, v, i) => s + v * (y[i] - muF) ** 2, 0)
+  const tau2 = Math.max(0, (Q - (k - 1)) / (sw - w.reduce((s, v) => s + v * v, 0) / sw))
+  const ws = vr.map((s) => 1 / (s + tau2))
+  const sws = ws.reduce((s, v) => s + v, 0)
+  const mu = ws.reduce((s, v, i) => s + v * y[i], 0) / sws
+  const t = T95[Math.min(Math.max(k - 2, 1), T95.length) - 1]
+  const meia = t * Math.sqrt(tau2 + 1 / sws)
+  const expit = (z: number) => 1 / (1 + Math.exp(-z))
+  return [expit(mu - meia), expit(mu + meia)]
+}
+
+/**
+ * Painel da captação: pontua uma base (com ou sem compradores) com um modelo e
+ * resume a qualidade dela contra o histórico de treino do modelo.
+ */
+async function rotaCaptacao(c: Client, req: Request) {
+  const corpo = (await req.json()) as { modelo_id?: string; dataset_id?: string; taxa_alvo?: number }
+  if (!corpo.modelo_id || !corpo.dataset_id) throw new ErroHttp(400, 'Informe o modelo e a base.')
+  const taxaAlvo = Number(corpo.taxa_alvo)
+  if (corpo.taxa_alvo != null && !(taxaAlvo > 0 && taxaAlvo < 1)) {
+    throw new ErroHttp(400, 'A taxa observada precisa estar entre 0 e 100%.')
+  }
+  const { rows: ms } = await c.query('select * from leadscore.modelos where id = $1', [corpo.modelo_id])
+  if (!ms.length) throw new ErroHttp(404, 'Modelo não encontrado.')
+  const modelo = ms[0]
+  if (!modelo.stats?.interceptos || !modelo.stats?.referencia) {
+    throw new ErroHttp(400, 'Este modelo é de uma versão antiga (sem probabilidade). Treine o modelo de novo na tela Modelo.')
+  }
+  const dataset = await pegarDataset(c, corpo.dataset_id)
+  const d = [dataset.id]
+
+  await aplicarModelo(c, d, modelo.pesos, modelo.stats.interceptos, modelo.stats.referencia)
+  const teto = Number(modelo.stats.teto_prob) > 0 ? Number(modelo.stats.teto_prob) : 1
+
+  // Recalibração do nível: o modelo acerta a ORDEM dos leads, mas o nível da conversão muda de lançamento
+  // para lançamento (7,9% a 11,1% nas bases de treino) e as respostas da pesquisa não explicam isso. Com a taxa
+  // observada da captação, desloca o intercepto (em logit) até a média bater com ela. Não mexe em score nem classe.
+  let delta = 0
+  let probMediaAntes: number | null = null
+  if (taxaAlvo > 0) {
+    const { rows: ps } = await c.query('select prob::float8 as p from leadscore.leads where dataset_id = $1 and prob is not null', d)
+    const logits = ps.map((r: { p: number }) => {
+      const p = Math.min(Math.max(r.p, 1e-6), 1 - 1e-6)
+      return Math.log(p / (1 - p))
+    })
+    const media = (dl: number) =>
+      logits.reduce((s: number, z: number) => s + Math.min(1 / (1 + Math.exp(-(z + dl))), teto), 0) / (logits.length || 1)
+    probMediaAntes = media(0)
+    let lo = -6
+    let hi = 6
+    for (let i = 0; i < 50; i++) {
+      const mid = (lo + hi) / 2
+      if (media(mid) < taxaAlvo) lo = mid
+      else hi = mid
+    }
+    delta = (lo + hi) / 2
+  }
+  const probSql = (col: string) => {
+    const t = teto.toFixed(4)
+    if (delta === 0) return `least(${col}, ${t})`
+    const p = `least(greatest(${col}, 1e-6), 1 - 1e-6)`
+    return `least(1 / (1 + exp(-(ln(${p} / (1 - ${p})) + ${delta.toFixed(6)}))), ${t})`
+  }
+  const P = probSql('prob') // chance exibida: nunca acima do teto observado em lançamento novo
+  const PL = probSql('l.prob')
+
+  const R = (
+    await c.query(
+      `select count(*)::int as leads,
+              count(*) filter (where respondeu)::int as responderam,
+              avg(${P})::float8 as prob_media, sum(${P})::float8 as compras_esperadas,
+              avg(score)::float8 as score_medio,
+              count(*) filter (where classe = 'hot')::int as hot,
+              count(*) filter (where classe = 'warm')::int as warm,
+              count(*) filter (where classe = 'cold')::int as cold,
+              count(*) filter (where comprou)::int as compradores
+         from leadscore.leads where dataset_id = $1`,
+      d,
+    )
+  ).rows[0]
+
+  const faixas = (
+    await c.query(
+      `select least(score / 10, 9) as ord, count(*)::int as leads, avg(${P})::float8 as prob_media
+         from leadscore.leads where dataset_id = $1 group by 1 order by 1`,
+      d,
+    )
+  ).rows.map((f: any) => ({
+    faixa: `${f.ord * 10}–${f.ord === 9 ? 100 : f.ord * 10 + 9}`,
+    leads: f.leads,
+    prob_media: arr4(f.prob_media),
+  }))
+
+  const perguntaOrigem = ((modelo.perguntas || []) as string[]).find((p) => /origem|utm_source/i.test(p))
+  const historicoPorOrigem = new Map<string, number>()
+  if (perguntaOrigem) {
+    const { rows } = await c.query(
+      `select coalesce(nullif(respostas ->> $2, ''), '(sem origem)') as origem,
+              (count(*) filter (where comprou))::float8 / count(*) as taxa
+         from leadscore.leads where dataset_id = any($1) group by 1 having count(*) >= 30`,
+      [modelo.datasets, perguntaOrigem],
+    )
+    for (const r of rows) historicoPorOrigem.set(r.origem, Number(r.taxa))
+  }
+  const porOrigem = perguntaOrigem
+    ? (
+        await c.query(
+          `select coalesce(nullif(respostas ->> $2, ''), '(sem origem)') as origem,
+                  count(*)::int as leads, avg(${P})::float8 as prob_media, avg(score)::float8 as score_medio,
+                  (count(*) filter (where classe = 'hot'))::float8 / count(*) as pct_hot
+             from leadscore.leads where dataset_id = $1
+            group by 1 order by 2 desc limit 12`,
+          [dataset.id, perguntaOrigem],
+        )
+      ).rows.map((o: any) => ({
+        origem: o.origem,
+        leads: o.leads,
+        prob_media: arr4(o.prob_media),
+        score_medio: Math.round(o.score_medio),
+        pct_hot: arr4(o.pct_hot),
+        taxa_historica: historicoPorOrigem.has(o.origem) ? arr4(historicoPorOrigem.get(o.origem)) : null,
+      }))
+    : []
+
+  const porDia = (
+    await c.query(
+      `select substring(data_lead from '^[0-9]{4}-[0-9]{2}-[0-9]{2}') as dia, count(*)::int as leads,
+              avg(${P})::float8 as prob_media, avg(score)::float8 as score_medio
+         from leadscore.leads where dataset_id = $1
+        group by 1 order by 1 nulls last`,
+      d,
+    )
+  ).rows.map((x: any) => ({ dia: x.dia, leads: x.leads, prob_media: arr4(x.prob_media), score_medio: Math.round(x.score_medio) }))
+
+  // --- perfil do público: distribuição de cada resposta aqui vs. nas bases de treino ---
+  const respostasPerfil = ((modelo.perguntas || []) as string[]).filter((p) => p !== perguntaOrigem)
+  const perfil: unknown[] = []
+  if (respostasPerfil.length) {
+    const agg = async (datasets: string[]) =>
+      (
+        await c.query(
+          `select e.key as pergunta, coalesce(nullif(trim(e.value), ''), '(não respondeu)') as resposta,
+                  count(*)::int as leads, avg(${PL})::float8 as prob_media
+             from leadscore.leads l
+             cross join lateral jsonb_each_text(l.respostas) e
+            where l.dataset_id = any($1) and e.key = any($2)
+            group by 1, 2`,
+          [datasets, respostasPerfil],
+        )
+      ).rows
+    const aqui = await agg(d)
+    const antes = await agg(modelo.datasets)
+    const totalAqui = R.leads || 1
+    const totalAntes = (await c.query('select count(*)::int as n from leadscore.leads where dataset_id = any($1)', [modelo.datasets])).rows[0].n || 1
+    for (const q of respostasPerfil) {
+      const hist = new Map(antes.filter((r: any) => r.pergunta === q).map((r: any) => [r.resposta, r.leads / totalAntes]))
+      perfil.push({
+        pergunta: q,
+        respostas: aqui
+          .filter((r: any) => r.pergunta === q)
+          .sort((a: any, b: any) => b.leads - a.leads)
+          .map((r: any) => ({
+            resposta: r.resposta,
+            leads: r.leads,
+            pct: arr4(r.leads / totalAqui),
+            pct_historico: hist.has(r.resposta) ? arr4(hist.get(r.resposta)) : null,
+            prob_media: arr4(r.prob_media),
+          })),
+      })
+    }
+  }
+
+  // --- campanha, criativo, público (UTMs guardadas como extras) ---
+  const dimensoes: { chave: string; titulo: string }[] = [
+    { chave: 'utm_campaign', titulo: 'Campanha' },
+    { chave: 'utm_content', titulo: 'Criativo / anúncio' },
+    { chave: 'utm_medium', titulo: 'Público / conjunto' },
+  ]
+  const porDimensao: unknown[] = []
+  for (const dim of dimensoes) {
+    const { rows } = await c.query(
+      `select extras ->> $2 as valor, count(*)::int as leads, avg(${P})::float8 as prob_media,
+              avg(score)::float8 as score_medio,
+              (count(*) filter (where classe = 'hot'))::float8 / count(*) as pct_hot
+         from leadscore.leads where dataset_id = $1 and nullif(extras ->> $2, '') is not null
+        group by 1 having count(*) >= 30 order by 2 desc limit 15`,
+      [dataset.id, dim.chave],
+    )
+    if (rows.length) {
+      porDimensao.push({
+        chave: dim.chave,
+        titulo: dim.titulo,
+        itens: rows.map((r: any) => ({
+          valor: r.valor, leads: r.leads, prob_media: arr4(r.prob_media),
+          score_medio: Math.round(r.score_medio), pct_hot: arr4(r.pct_hot),
+        })),
+      })
+    }
+  }
+
+  // --- melhores leads (para o comercial agir já) ---
+  const topLeads = (
+    await c.query(
+      `select nome, email, telefone_fmt, score, ${P}::float8 as prob,
+              coalesce(nullif(respostas ->> $2, ''), '') as origem
+         from leadscore.leads where dataset_id = $1 and prob is not null
+        order by prob desc, linha limit 15`,
+      [dataset.id, perguntaOrigem ?? ''],
+    )
+  ).rows.map((l: any) => ({ nome: l.nome, email: l.email, telefone: l.telefone_fmt, score: l.score, prob: arr4(l.prob), origem: l.origem }))
+
+  // quanto das vendas do histórico veio de gente que estava na lista de leads (o resto comprou por outros caminhos)
+  const { rows: cob } = await c.query(
+    `select coalesce(sum((a.stats ->> 'total_compras')::float8), 0) as da_lista,
+            coalesce(sum((a.meta ->> 'compradores_banco')::float8), 0) as totais,
+            min((a.stats ->> 'total_compras')::float8 / nullif((a.meta ->> 'compradores_banco')::float8, 0)) as cob_min,
+            max((a.stats ->> 'total_compras')::float8 / nullif((a.meta ->> 'compradores_banco')::float8, 0)) as cob_max
+       from (select distinct on (dataset_id) stats, meta from leadscore.analises
+              where dataset_id = any($1) order by dataset_id, criada_em desc) a`,
+    [modelo.datasets],
+  )
+  const cobertura = Number(cob[0].totais) ? Number(cob[0].da_lista) / Number(cob[0].totais) : null
+  // a cobertura varia muito entre lançamentos (41%–77%): por isso as vendas totais saem como faixa, não como ponto
+  const cobMin = Number(cob[0].cob_min) || null
+  const cobMax = Number(cob[0].cob_max) || null
+  // faixa da conversão de um lançamento novo: intervalo de previsão de efeitos aleatórios (DerSimonian-Laird) sobre o
+  // logit da taxa de cada base de treino. Com poucas bases o intervalo é largo de propósito: min–max das bases subestima.
+  const [convMin, convMax] = intervaloNovoLancamento(
+    ((modelo.stats.bases || []) as { leads: number; compras: number }[]).map((b) => ({ n: Number(b.leads), x: Number(b.compras) })),
+  )
+
+  const probTreino = Number(modelo.stats.prob_media_treino) || 0
+  const razao = probTreino ? R.prob_media / probTreino : null
+  const veredito = razao === null ? 'indefinido' : razao >= 1.1 ? 'acima' : razao <= 0.9 ? 'abaixo' : 'em_linha'
+
+  return json({
+    base: { id: dataset.id, nome: dataset.nome, total_linhas: dataset.total_linhas },
+    modelo: { id: modelo.id, nome: modelo.nome, criado_em: modelo.criado_em },
+    resumo: {
+      leads: R.leads,
+      responderam: R.responderam,
+      pct_responderam: arr4(R.responderam / R.leads),
+      prob_media: arr4(R.prob_media),
+      compras_esperadas: Math.round(R.compras_esperadas),
+      cobertura_historica: cobertura === null ? null : arr4(cobertura),
+      vendas_totais_estimadas: cobertura ? Math.round(R.compras_esperadas / cobertura) : null,
+      vendas_totais_faixa: cobMin && cobMax ? [Math.round(R.compras_esperadas / cobMax), Math.round(R.compras_esperadas / cobMin)] : null,
+      conversao_faixa_historica: convMin !== null && convMax !== null ? [arr4(convMin), arr4(convMax)] : null,
+      compras_faixa_historica: convMin !== null && convMax !== null ? [Math.round(R.leads * convMin), Math.round(R.leads * convMax)] : null,
+      calibracao: delta === 0 ? null : { taxa_alvo: arr4(taxaAlvo), prob_media_antes: arr4(probMediaAntes), delta_logit: arr4(delta) },
+      score_medio: Math.round(R.score_medio),
+      teto_prob: teto < 1 ? teto : null,
+      classes: { hot: R.hot, warm: R.warm, cold: R.cold },
+      pct_hot: arr4(R.hot / R.leads),
+      pct_hot_historico: 0.2,
+      compradores_conhecidos: R.compradores,
+    },
+    comparacao: {
+      prob_media_historico: arr4(probTreino),
+      razao: razao === null ? null : Math.round(razao * 100) / 100,
+      veredito,
+      bases_treino: (modelo.stats.bases || []).map((b: any) => ({
+        nome: b.nome, leads: b.leads, compras: b.compras, taxa_base: b.taxa_base,
+      })),
+    },
+    faixas,
+    por_origem: porOrigem,
+    por_dimensao: porDimensao,
+    perfil,
+    top_leads: topLeads,
+    por_dia: porDia,
+  })
+}
+
 // --------------------------------------------------------------- roteador ---
 
 async function api(req: Request, env: Env, url: URL): Promise<Response> {
@@ -724,8 +1323,14 @@ async function api(req: Request, env: Env, url: URL): Promise<Response> {
     return rotaExport(env, partes[1], url)
   }
 
+  if (partes[0] === 'modelos' && partes.length === 3 && partes[2] === 'export' && metodo === 'GET') {
+    return rotaExportModelo(env, partes[1], url)
+  }
+
   return comBanco(env, async (c) => {
     if (rota === 'turmas' && metodo === 'GET') return rotaTurmas(c)
+
+    if (rota === 'captacao' && metodo === 'POST') return rotaCaptacao(c, req)
 
     if (partes[0] === 'datasets') {
       if (partes.length === 1 && metodo === 'GET') return rotaListarDatasets(c)
